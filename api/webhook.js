@@ -5,7 +5,6 @@ module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
 
   const sig = req.headers['stripe-signature'];
-  // req.body is raw Buffer thanks to express.raw() in server.js
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
@@ -22,21 +21,31 @@ module.exports = async function handler(req, res) {
   const getEmail = (obj) => obj?.customer_email || obj?.metadata?.email || null;
   const getPeriodEnd = (obj) => obj?.current_period_end
     ? new Date(obj.current_period_end * 1000).toISOString()
-    : null;
+    : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); // fallback: 30 days
 
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
         const email = getEmail(session);
-        if (!email) break;
-        const sub = await stripe.subscriptions.retrieve(session.subscription);
+        if (!email) { console.log('No email in session'); break; }
+
+        let periodEnd = getPeriodEnd(null); // default 30 days
+        if (session.subscription) {
+          try {
+            const sub = await stripe.subscriptions.retrieve(session.subscription);
+            periodEnd = getPeriodEnd(sub);
+          } catch (e) {
+            console.log('Could not retrieve subscription, using default period end');
+          }
+        }
+
         await supabase.from('subscribers').upsert({
           email: email.toLowerCase(),
           stripe_customer_id: session.customer,
-          stripe_subscription_id: session.subscription,
+          stripe_subscription_id: session.subscription || null,
           status: 'active',
-          current_period_end: getPeriodEnd(sub),
+          current_period_end: periodEnd,
           updated_at: new Date().toISOString()
         }, { onConflict: 'email' });
         console.log('New subscriber:', email);
@@ -44,13 +53,19 @@ module.exports = async function handler(req, res) {
       }
       case 'invoice.payment_succeeded': {
         const invoice = event.data.object;
-        const sub = await stripe.subscriptions.retrieve(invoice.subscription);
-        const email = getEmail(invoice) || getEmail(sub);
+        let periodEnd = getPeriodEnd(null);
+        if (invoice.subscription) {
+          try {
+            const sub = await stripe.subscriptions.retrieve(invoice.subscription);
+            periodEnd = getPeriodEnd(sub);
+          } catch (e) {}
+        }
+        const email = getEmail(invoice);
         if (!email) break;
         await supabase.from('subscribers').upsert({
           email: email.toLowerCase(),
           status: 'active',
-          current_period_end: getPeriodEnd(sub),
+          current_period_end: periodEnd,
           updated_at: new Date().toISOString()
         }, { onConflict: 'email' });
         break;
